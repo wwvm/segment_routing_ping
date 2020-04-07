@@ -1,3 +1,6 @@
+#!/bin/env python3
+# -*- encoding: utf-8 -*-
+
 from socket import socket, inet_aton, htons, AF_PACKET, SOCK_RAW
 import numpy as np
 import struct
