@@ -1,10 +1,13 @@
-#!/bin/env python3
-# -*- encoding: utf-8 -*-
-
-from socket import socket, inet_aton, htons, AF_PACKET, SOCK_RAW
+from socket import socket, inet_ntoa, inet_aton, htons, AF_PACKET, SOCK_RAW
 import numpy as np
+import ipaddress
 import struct
+import select
+import binascii
 import argparse
+import netifaces as nic
+from getmac import get_mac_address
+import time
 
 ids = []
 seq = 8760
@@ -102,35 +105,74 @@ def chksum(payload):
     return ~checksum & 0xffff
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('integers', metavar='N', type=int, nargs='+')
-    parser.add_argument('--sum', dest-'accumulate', action='store_const', const=sum, default=max)
+def recv(sock, id, tick, timeout):
+    time_left = timeout
+    while time_left > 0:
+        started = time.time()
+        ready = select.select([sock], [], [], time_left)
+        elapsed = time.time() - started
+        if len(ready) == 0:
+            return
+        received = time.time()
+        pkt = sock.recv(2048)
+        data = struct.unpack('!BBHHHBBHII', pkt[14:34])
+        time_left -= received - tick
+        rseq, ttl, src, dst = data[3], data[5], data[8], data[9]
+        if rseq + 1 == seq:
+            print(f'{ipaddress.IPv4Address(src)} <-> {ipaddress.IPv4Address(dst)}: ttl {ttl}, latency {(received - tick) * 1e6} us')
+            return
+    print('Timeout')
+
+
+def parseArgs():
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('-i', '--interface', required=True, help='source interface to use')
+    parser.add_argument('-n', '--nexthop', dest='nexthop', required=True, help='next hop IP address')
+    parser.add_argument('-d', '--destination', help='destination IP address')
+    parser.add_argument('-c', '--count', nargs='?', type=int, default=10, help='Num of packet to sent')
+    parser.add_argument('-t', '--keep', action='store_true', help='Keep sending the packets')
+    parser.add_argument('labels', metavar='Label', nargs='*', type=int, help='mpls labels to pass by')
+
     args = parser.parse_args()
-    print(args.accumulate(args.integers))
+    # get MAC and ip from inteface
+    addrs = nic.ifaddresses(args.interface)
+    mac_src = addrs[nic.AF_LINK][0]['addr']
+    ip_src = addrs[nic.AF_INET][0]['addr']
 
-    ifname = 'ens160'
+    # get MAC from next hop
+    mac_dst = get_mac_address(ip=args.nexthop)
+
+    # destination
+    ip_dst = ip_src if args.destination is None else args.destination
+
+    return {'interface': args.interface, 'mac_src': mac_src, 'mac_dst': mac_dst, 'ip_src': ip_src, 'ip_dst': ip_dst,
+            'count': args.count, 'keep': args.keep, 'labels': args.labels}
+
+
+if __name__ == '__main__':
+    args = parseArgs()
+
+    ifname = args.get('interface')
     # next hop 10.124.209.195 00:50:56:97:09:75
-    mac_src, mac_dst = '00:50:56:97:9a:7f', '00:50:56:97:8c:bc'
-    ip_src, ip_dst = '10.1.1.1', '192.2.235.235'
-    #paths = [17]
-    paths = [18215,17113,17014,17007,17111]
-    #17001/17003/16194
-    num_to_send = 1
+    mac_src, mac_dst = args.get('mac_src'), args.get('mac_dst')
+    ip_src, ip_dst = args.get('ip_src'), args.get('ip_dst')
+    paths = args.get('labels')
+    num_to_send = args.get('count')
 
-    s = socket(AF_PACKET, SOCK_RAW)
-    s.bind((ifname, 0))
+    s = socket(AF_PACKET, SOCK_RAW, htons(3))
+    s.bind((ifname, 3))
+    s.setblocking(0)
 
-    import time
     num = 0
-    while num < num_to_send:
-        #packet = eth_hdr(mac_dst, mac_src, PROTO_IPV4) + \
-        packet = eth_hdr(mac_dst, mac_src, PROTO_MPLS) + \
-            mpls_hdr(paths) + \
-            ip_payload(ip_src, ip_dst, payload=udp(dst=4521))
+    print(f'sending packet with path: {paths}')
+    while args.get('keep') or num < num_to_send:
+        packet = eth_hdr(mac_dst, mac_src, PROTO_MPLS if len(paths) > 0 else PROTO_IPV4)
+        if len(paths) > 0:
+            packet += mpls_hdr(paths)
+        packet += ip_payload(ip_src, ip_dst, payload=udp(dst=4521))
         r = s.send(packet)
-        print(f'{num+1} sent {r} bytes!')
         num += 1
+        recv(s, None, time.time(), 3)
         time.sleep(1)
 
     print(f'Total sent {num_to_send}.')
